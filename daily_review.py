@@ -1,17 +1,15 @@
 """
-Daily Financial Review — PocketSmith + Claude + Gmail SMTP
+Daily Financial Review — PocketSmith + Gmail SMTP
 Designed for GitHub Actions (cron schedule). No local dependencies.
 
 Required environment variables:
   POCKETSMITH_API_KEY  — from pocketsmith.com/manage#developer
-  ANTHROPIC_API_KEY    — from console.anthropic.com/settings/keys
   GMAIL_ADDRESS        — your Gmail address (todd@toddcop.com)
   GMAIL_APP_PASSWORD   — App Password from myaccount.google.com/apppasswords
   REPORT_TO_EMAIL      — recipient address (can be same as GMAIL_ADDRESS)
 """
 
 import os
-import json
 import re
 import sys
 import smtplib
@@ -20,13 +18,21 @@ from email.mime.text import MIMEText
 from datetime import date, timedelta
 
 import requests
-import anthropic
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
 USER_ID = 740584
 PS_BASE = "https://api.pocketsmith.com/v2"
-GBP_USD = 0.859  # fallback exchange rate; PocketSmith provides per-transaction rates
+GBP_USD = 0.859  # fallback exchange rate
+
+LARGE_TXN_THRESHOLD = 500  # flag transactions over this amount (in original currency)
+
+# Known merchants — do NOT flag these in unusual transactions
+KNOWN_PAYEES = [
+    "MINDY APPEL", "ALLWYN ENT", "T-MOBILE", "TMOBILE", "URSA MINOR",
+    "GOFUNDME", "GFM*GOFUNDME", "META PPGF", "MONAGEER", "FLATFAIR",
+    "UBS", "DANSKE", "ZELLE",
+]
 
 # ── PocketSmith helpers ──────────────────────────────────────────────────────
 
@@ -128,7 +134,7 @@ SUPER_CATS = {
     "Income":                  [28938652],
     "Home & Living":           [28937992, 28939400, 28939436],
     "Food, Health & Personal": [28937960, 28938032, 28938020],
-    "Lifestyle":               [28938640, 28938084],      # + Subscriptions id 29202689
+    "Lifestyle":               [28938640, 28938084],
     "Money & Work":            [28938056, 28937944, 28939072, 28939220, 28937952],
 }
 
@@ -167,7 +173,6 @@ def apply_categorization_rules(key, transactions, source_label):
                     except Exception as e:
                         print(f"  ✗ Failed {txn['payee']}: {e}", file=sys.stderr)
                 else:
-                    # Correct category but needs_review still set — just clear it
                     if txn.get("needs_review"):
                         try:
                             update_transaction(key, txn["id"], {"needs_review": False})
@@ -178,23 +183,17 @@ def apply_categorization_rules(key, transactions, source_label):
 
 
 def aggregate_budget(budget_data):
-    """Roll up budget data into super categories. Returns dict of super_cat → {actual, forecast}."""
-    # Build category → parent_id map
-    cat_parent = {item["category"]["id"]: item["category"].get("parent_id")
-                  for item in budget_data}
-
+    """Roll up budget data into super categories."""
     totals = {k: {"actual": 0.0, "forecast": 0.0} for k in SUPER_CATS}
 
     for item in budget_data:
         cat = item["category"]
         cat_id = cat["id"]
         parent_id = cat.get("parent_id")
-        is_transfer_cat = item.get("is_transfer", False)
 
-        if is_transfer_cat:
+        if item.get("is_transfer", False):
             continue
 
-        # Determine which super category this belongs to
         super_cat = None
         if cat_id == SUBSCRIPTIONS_ID or parent_id == SUBSCRIPTIONS_ID:
             super_cat = "Lifestyle"
@@ -207,33 +206,23 @@ def aggregate_budget(budget_data):
         if not super_cat:
             continue
 
-        currency = None
-        actual = 0.0
-        forecast = 0.0
-
-        # Use expense data for expense super categories, income for Income
         if super_cat == "Income":
             period = item.get("income")
-            if period:
-                currency = period.get("currency_code", "gbp")
-                actual = float(period.get("total_actual_amount") or 0)
-                forecast = float(period.get("total_forecast_amount") or 0)
         else:
             period = item.get("expense")
-            if period:
-                currency = period.get("currency_code", "gbp")
-                actual = abs(float(period.get("total_actual_amount") or 0))
-                forecast = abs(float(period.get("total_forecast_amount") or 0))
 
         if not period:
             continue
 
-        # Convert to GBP if needed
+        currency = period.get("currency_code", "gbp")
+        actual = abs(float(period.get("total_actual_amount") or 0))
+        forecast = abs(float(period.get("total_forecast_amount") or 0))
+
         if currency and currency.lower() == "usd":
             actual *= GBP_USD
             forecast *= GBP_USD
         elif currency and currency.lower() == "eur":
-            actual *= 0.85  # approximate EUR→GBP
+            actual *= 0.85
             forecast *= 0.85
 
         totals[super_cat]["actual"] += actual
@@ -241,6 +230,152 @@ def aggregate_budget(budget_data):
 
     return totals
 
+
+# ── Report generation ────────────────────────────────────────────────────────
+
+def fmt_amount(amount, currency="GBP"):
+    sym = {"GBP": "£", "USD": "$", "EUR": "€"}.get(currency.upper(), currency + " ")
+    return f"{sym}{abs(float(amount)):.2f}"
+
+
+def is_known_payee(payee):
+    up = (payee or "").upper()
+    return any(k in up for k in KNOWN_PAYEES)
+
+
+def generate_report(today, auto_done, remaining_uncategorized, remaining_needs_review,
+                    recent, budget_totals):
+    lines = []
+    lines.append(f"# Daily Financial Review — {today}")
+    lines.append("")
+
+    # ── Action Required ──
+    lines.append("## Action Required")
+    lines.append("")
+    action_items = []
+
+    for txn in remaining_uncategorized:
+        if txn.get("is_transfer"):
+            continue
+        ta = txn.get("transaction_account", {})
+        currency = ta.get("currency_code", "GBP").upper()
+        action_items.append(
+            f"**{txn['payee']} — {fmt_amount(txn['amount'], currency)} | "
+            f"{ta.get('name', '?')} | {txn['date']}**  \n"
+            f"Uncategorized. Assign a category."
+        )
+
+    for txn in remaining_needs_review:
+        if txn.get("is_transfer"):
+            continue
+        ta = txn.get("transaction_account", {})
+        currency = ta.get("currency_code", "GBP").upper()
+        cat_name = (txn.get("category") or {}).get("title", "unknown category")
+        action_items.append(
+            f"**{txn['payee']} — {fmt_amount(txn['amount'], currency)} | "
+            f"{ta.get('name', '?')} | {txn['date']}**  \n"
+            f"Flagged for review. Currently: {cat_name}."
+        )
+
+    if action_items:
+        for item in action_items:
+            lines.append(item)
+            lines.append("")
+    else:
+        lines.append("Nothing requires your attention today.")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+
+    # ── Auto-Categorized ──
+    lines.append("## Auto-Categorized")
+    lines.append("")
+    if auto_done:
+        lines.append("| Payee | Amount | Account | Old Category | New Category |")
+        lines.append("|---|---|---|---|---|")
+        for a in auto_done:
+            amt = fmt_amount(a["amount"], a.get("currency", "GBP"))
+            lines.append(
+                f"| {a['payee']} | {amt} | {a['account']} | "
+                f"{a['old_category']} | {a['new_category']} |"
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Budget Summary ──
+    lines.append("## Spending by Super Category (Month to Date)")
+    lines.append("")
+    lines.append("| Super Category | MTD Spend | Budget | % Used |")
+    lines.append("|---|---|---|---|")
+    budget_notes = []
+    for sc, vals in budget_totals.items():
+        actual = vals["actual"]
+        forecast = vals["forecast"]
+        pct = round(actual / forecast * 100) if forecast else 0
+        flag = " 🚨" if pct > 100 else (" ⚠️" if pct > 80 else "")
+        lines.append(f"| {sc} | £{actual:,.0f} | £{forecast:,.0f} | {pct}%{flag} |")
+        if pct > 100:
+            budget_notes.append(f"**{sc}** is over budget ({pct}% of £{forecast:,.0f}).")
+        elif pct > 80:
+            budget_notes.append(f"**{sc}** is at {pct}% of budget — running hot.")
+    lines.append("")
+    if budget_notes:
+        lines.append("**Notes:**")
+        for note in budget_notes:
+            lines.append(f"- {note}")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Unusual Transactions ──
+    lines.append("## Unusual Transactions (Last 48 Hours)")
+    lines.append("")
+    unusual = []
+    seen = {}  # for duplicate detection: (payee, amount, date) → count
+
+    for txn in recent:
+        ta = txn.get("transaction_account", {})
+        currency = ta.get("currency_code", "GBP").upper()
+        amt = abs(float(txn["amount"]))
+        key = (txn["payee"], txn["amount"], txn["date"])
+        seen[key] = seen.get(key, 0) + 1
+
+        if amt >= LARGE_TXN_THRESHOLD and not is_known_payee(txn["payee"]):
+            unusual.append(
+                f"**{txn['payee']}** — {fmt_amount(txn['amount'], currency)} | "
+                f"{ta.get('name', '?')} | {txn['date']} — large transaction."
+            )
+
+    for (payee, amount, txn_date), count in seen.items():
+        if count > 1:
+            unusual.append(f"**Possible duplicate:** {payee} {amount} on {txn_date} appears {count}×.")
+
+    if unusual:
+        for u in unusual:
+            lines.append(f"- {u}")
+    else:
+        lines.append("No transactions over the £500/$500 threshold. No duplicates detected.")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── All Clear ──
+    lines.append("## All Clear")
+    lines.append("")
+    lines.append(
+        "- No duplicates detected in last 48 hours.\n"
+        "- Auto-categorization rules applied successfully.\n"
+        "- Budget rollup complete."
+    )
+
+    return "\n".join(lines)
+
+
+# ── Email ────────────────────────────────────────────────────────────────────
 
 def md_to_html(md):
     """Minimal markdown → HTML conversion for email."""
@@ -252,7 +387,6 @@ def md_to_html(md):
     html = re.sub(r'~~(.+?)~~', r'<del>\1</del>', html)
     html = re.sub(r'`(.+?)`', r'<code>\1</code>', html)
 
-    # Tables
     lines = html.split('\n')
     result_lines, in_table, table_rows = [], False, []
     for line in lines:
@@ -298,12 +432,11 @@ def send_email_smtp(gmail_address, app_password, to_address, subject, body_html)
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ps_key       = os.environ["POCKETSMITH_API_KEY"]
-    anth_key     = os.environ["ANTHROPIC_API_KEY"]
-    gmail_addr   = os.environ["GMAIL_ADDRESS"]
-    gmail_pass   = os.environ["GMAIL_APP_PASSWORD"]
-    report_to    = os.environ.get("REPORT_TO_EMAIL", gmail_addr)
-    today = date.today().isoformat()
+    ps_key     = os.environ["POCKETSMITH_API_KEY"]
+    gmail_addr = os.environ["GMAIL_ADDRESS"]
+    gmail_pass = os.environ["GMAIL_APP_PASSWORD"]
+    report_to  = os.environ.get("REPORT_TO_EMAIL", gmail_addr)
+    today      = date.today().isoformat()
 
     print("── Fetching PocketSmith data ──")
     uncategorized = fetch_uncategorized(ps_key)
@@ -313,102 +446,21 @@ def main():
     print(f"  uncategorized={len(uncategorized)}  needs_review={len(needs_review)}  recent={len(recent)}")
 
     print("── Applying categorization rules ──")
-    auto_done = []
+    auto_done  = []
     auto_done += apply_categorization_rules(ps_key, uncategorized, "uncategorized")
     auto_done += apply_categorization_rules(ps_key, needs_review, "needs_review")
+
+    # Re-fetch after updates so remaining lists are accurate
+    uncategorized = fetch_uncategorized(ps_key)
+    needs_review  = fetch_needs_review(ps_key)
 
     print("── Aggregating budget ──")
     budget_totals = aggregate_budget(budget)
 
-    print("── Calling Claude for report ──")
-    client = anthropic.Anthropic(api_key=anth_key)
-
-    # Trim transaction data to what Claude needs (strip verbose institution/logo fields)
-    def slim(txns):
-        out = []
-        for t in txns:
-            ta = t.get("transaction_account", {})
-            out.append({
-                "id": t["id"],
-                "date": t["date"],
-                "payee": t["payee"],
-                "amount": t["amount"],
-                "currency": ta.get("currency_code", "gbp").upper(),
-                "account": ta.get("name"),
-                "category": (t.get("category") or {}).get("title"),
-                "is_transfer": t.get("is_transfer"),
-                "needs_review": t.get("needs_review"),
-                "status": t.get("status"),
-                "memo": t.get("memo"),
-            })
-        return out
-
-    budget_summary = []
-    for sc, vals in budget_totals.items():
-        pct = round(vals["actual"] / vals["forecast"] * 100) if vals["forecast"] else 0
-        budget_summary.append({
-            "super_category": sc,
-            "actual_gbp": round(vals["actual"], 2),
-            "forecast_gbp": round(vals["forecast"], 2),
-            "pct_used": pct,
-        })
-
-    prompt = f"""You are running a daily financial review for Todd Copilevitz. Today is {today}.
-
-The following categorizations were already applied automatically this run:
-{json.dumps(auto_done, indent=2)}
-
-Remaining uncategorized transactions (after rules applied — anything here is genuinely ambiguous):
-{json.dumps(slim(uncategorized), indent=2)}
-
-Remaining needs-review transactions (after rules applied):
-{json.dumps(slim(needs_review), indent=2)}
-
-Recent transactions (last 48 hours) — flag any over £500 or $500, cryptic payees not on known-merchant list, duplicates:
-{json.dumps(slim(recent), indent=2)}
-
-Pre-aggregated budget by super category (already converted to GBP):
-{json.dumps(budget_summary, indent=2)}
-
-Known merchants (DO NOT flag these, they are expected):
-- MINDY APPEL = therapist payments (Healthcare)
-- ALLWYN ENT = National Lottery (Games)
-- T-Mobile / TMOBILE = phone plan (Utilities)
-- URSA MINOR = Ursa Minor Bakehouse, local café
-- GoFundMe / GFM = charity donation
-- Monageer property account entries = Ireland house purchase transfers, expected
-
-Write the report in this exact markdown format:
-
-# Daily Financial Review — {today}
-
-## Action Required
-[Items needing Todd's decision. If nothing, write: Nothing requires your attention today.]
-
-## Auto-Categorized
-[Table with columns: Payee | Amount | Account | Old Category | New Category
-Only include entries from the auto_done list above. If empty, write: None.]
-
-## Spending by Super Category (Month to Date)
-| Super Category | MTD Spend | Budget | % Used |
-|---|---|---|---|
-[Use the budget_summary data. Flag rows over 80% with ⚠️ and over 100% with 🚨.]
-
-## Unusual Transactions
-[Large amounts or suspicious items from recent transactions. If none, say so.]
-
-## All Clear
-[Confirm what areas have nothing to flag.]
-
-Be terse. No preamble. No sign-off."""
-
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
+    print("── Generating report ──")
+    report_md = generate_report(
+        today, auto_done, uncategorized, needs_review, recent, budget_totals
     )
-    report_md = response.content[0].text
-    print("── Report generated ──")
     print(report_md)
 
     print("── Sending email ──")
