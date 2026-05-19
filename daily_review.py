@@ -59,8 +59,9 @@ def fetch_needs_review(key):
 
 def fetch_recent(key, days=2):
     start = (date.today() - timedelta(days=days)).isoformat()
+    end = date.today().isoformat()
     return ps_get(key, f"/users/{USER_ID}/transactions",
-                  {"start_date": start, "per_page": 100})
+                  {"start_date": start, "end_date": end, "per_page": 100})
 
 
 def fetch_budget(key):
