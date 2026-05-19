@@ -1,0 +1,35 @@
+name: Daily Financial Review
+
+on:
+  schedule:
+    # 6:00 AM UTC = 7:00 AM BST (summer) / 8:00 AM Irish Standard Time
+    - cron: '0 6 * * *'
+
+  # Run manually from the Actions tab any time
+  workflow_dispatch:
+
+jobs:
+  daily-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install anthropic requests
+
+      - name: Run daily financial review
+        env:
+          POCKETSMITH_API_KEY: ${{ secrets.POCKETSMITH_API_KEY }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          REPORT_TO_EMAIL:     ${{ secrets.REPORT_TO_EMAIL }}
+        run: python daily_review.py
