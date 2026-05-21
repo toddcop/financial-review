@@ -2,6 +2,19 @@
 Daily Financial Review — PocketSmith + Gmail SMTP
 Designed for GitHub Actions (cron schedule). No local dependencies.
 
+THE FENCE (non-negotiable invariant):
+  This script may ONLY read (GET) and categorize transactions (PATCH /transactions).
+  It must NEVER delete/create/rename accounts, touch data feeds, or delete rules,
+  categories, or transactions. The PocketSmith API has endpoints for those actions;
+  this script must never call them. (On 2026-05-21 an automated run deleted an IRA
+  account over what was just feed lag — never again.) Account-level issues are
+  FLAGGED in the email for Todd, never acted on.
+
+LEARNING ("learn as it goes"):
+  Merchant knowledge lives in the RULES list below. When a new payee shows up under
+  "Action Required" in the email, add one line to RULES and commit — it is then
+  auto-categorized forever, across past and future transactions, on every run.
+
 Required environment variables:
   POCKETSMITH_API_KEY  — from pocketsmith.com/manage#developer
   GMAIL_ADDRESS        — your Gmail address (todd@toddcop.com)
@@ -12,6 +25,7 @@ Required environment variables:
 import os
 import re
 import sys
+import json
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -23,15 +37,37 @@ import requests
 
 USER_ID = 740584
 PS_BASE = "https://api.pocketsmith.com/v2"
-GBP_USD = 0.859  # fallback exchange rate
 
-LARGE_TXN_THRESHOLD = 500  # flag transactions over this amount (in original currency)
+# Fallback FX (used only if fx-rates.json is missing). The fx-rates.yml workflow
+# refreshes fx-rates.json daily; we read the live USD→GBP rate from it at runtime.
+FALLBACK_USD_GBP = 0.859
+FALLBACK_EUR_GBP = 0.85
+FX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fx-rates.json")
 
-# Known merchants — do NOT flag these in unusual transactions
+LARGE_TXN_THRESHOLD = 500   # flag transactions over this amount (original currency)
+FEED_STALE_DAYS = 3         # flag a live (non-offline) account if it hasn't updated in this many days
+
+
+def load_fx():
+    """Read live USD→GBP from fx-rates.json; fall back to constants. EUR not in file → fallback."""
+    usd_gbp, eur_gbp = FALLBACK_USD_GBP, FALLBACK_EUR_GBP
+    try:
+        with open(FX_FILE) as f:
+            data = json.load(f)
+        if data.get("USD"):
+            usd_gbp = float(data["USD"])
+        print(f"  FX: USD->GBP {usd_gbp} (fx-rates.json {data.get('date')})")
+    except Exception as e:
+        print(f"  FX: fx-rates.json unavailable, using fallback {usd_gbp}: {e}", file=sys.stderr)
+    return usd_gbp, eur_gbp
+
+
+# Known merchants — do NOT flag these as "unusual" large transactions
 KNOWN_PAYEES = [
     "MINDY APPEL", "ALLWYN ENT", "T-MOBILE", "TMOBILE", "URSA MINOR",
     "GOFUNDME", "GFM*GOFUNDME", "META PPGF", "MONAGEER", "FLATFAIR",
-    "UBS", "DANSKE", "ZELLE",
+    "UBS", "DANSKE", "ZELLE", "HYPERION", "CURRENCIES DIRECT", "CIT BANK",
+    "SCHWAB", "MOOD",
 ]
 
 # ── PocketSmith helpers ──────────────────────────────────────────────────────
@@ -74,20 +110,34 @@ def fetch_budget(key):
     return ps_get(key, f"/users/{USER_ID}/budget", {"roll_up": 1})
 
 
+def fetch_transaction_accounts(key):
+    return ps_get(key, f"/users/{USER_ID}/transaction_accounts")
+
+
 def update_transaction(key, txn_id, payload):
     return ps_patch(key, f"/transactions/{txn_id}", payload)
 
 
 # ── Categorization rules ─────────────────────────────────────────────────────
-# (payee_substring_uppercase, category_id, category_label, is_transfer)
+# (payee_substring_uppercase, category_id, category_label, force_not_transfer)
+# To teach the script a new merchant: add one line here and commit. Keep this list
+# in sync with the known_merchants memory note used by the Cowork assistant.
 
 RULES = [
     # Known merchants
     ("MINDY APPEL",        28939216, "Healthcare",            False),
     ("SQ *URSA MINOR",     28938632, "Cafes And Restaurants", False),
+    ("URSA MINOR",         28938632, "Cafes And Restaurants", False),
     ("SPICKSPAN",          28938036, "Personal Care",         False),
     ("SP MARLEYBONES",     28939472, "Pet Food And Supplies", False),
-    # Butchers
+    ("MARLEYBONES",        28939472, "Pet Food And Supplies", False),
+    ("MOOD",               28939408, "Wellness",              False),  # cannabis; corrected repeatedly, now permanent
+    ("GOOGLE",             29202689, "Subscriptions",         False),  # YouTube TV
+    ("THE WHITE HOUSE",    28937956, "Shopping",              False),  # clothing retailer, NOT education
+    ("CLOUD PICK",         28938632, "Cafes And Restaurants", False),  # Cloud Picker Coffee, Dublin Airport
+    ("DUB CLOUD PICK",     28938632, "Cafes And Restaurants", False),
+    ("COCA COLA NI",       28937964, "Groceries",             False),
+    # Butchers -> Groceries
     ("BUSHMILLS MEAT",     28937964, "Groceries",             False),
     ("MOUNTSANDEL MEAT",   28937964, "Groceries",             False),
     ("DONNELLY BUTCHER",   28937964, "Groceries",             False),
@@ -132,7 +182,8 @@ RULES = [
 # Super-category parent_id mappings
 SUPER_CATS = {
     "Income":                  [28938652],
-    "Home & Living":           [28937992, 28939400, 28939436],
+    # Home & Living incl. property capital works (CGT-deductible) + repairs/maintenance
+    "Home & Living":           [28937992, 28939400, 28939436, 32046111, 32046219],
     "Food, Health & Personal": [28937960, 28938032, 28938020],
     "Lifestyle":               [28938640, 28938084],
     "Money & Work":            [28938056, 28937944, 28939072, 28939220, 28937952],
@@ -169,9 +220,9 @@ def apply_categorization_rules(key, transactions, source_label):
                             "old_category": current_cat.get("title", source_label),
                             "new_category": cat_name,
                         })
-                        print(f"  ✓ {txn['payee']} → {cat_name}")
+                        print(f"  OK {txn['payee']} -> {cat_name}")
                     except Exception as e:
-                        print(f"  ✗ Failed {txn['payee']}: {e}", file=sys.stderr)
+                        print(f"  FAIL {txn['payee']}: {e}", file=sys.stderr)
                 else:
                     if txn.get("needs_review"):
                         try:
@@ -182,7 +233,30 @@ def apply_categorization_rules(key, transactions, source_label):
     return actions
 
 
-def aggregate_budget(budget_data):
+def check_feed_health(accounts, stale_days=FEED_STALE_DAYS):
+    """Return [(institution, account_name, last_date, age_days)] for live accounts whose
+    balance hasn't updated in > stale_days. Offline/manual accounts are skipped. A silently
+    dead feed is the most dangerous blind spot — surface it, never try to fix it."""
+    today = date.today()
+    stale = []
+    for a in accounts:
+        if a.get("offline"):
+            continue
+        cbd = a.get("current_balance_date")
+        if not cbd:
+            continue
+        try:
+            d = date.fromisoformat(str(cbd)[:10])
+        except Exception:
+            continue
+        age = (today - d).days
+        if age > stale_days:
+            inst = (a.get("institution") or {}).get("title", "?")
+            stale.append((inst, a.get("name", "?"), cbd, age))
+    return sorted(stale, key=lambda x: -x[3])
+
+
+def aggregate_budget(budget_data, usd_gbp, eur_gbp):
     """Roll up budget data into super categories."""
     totals = {k: {"actual": 0.0, "forecast": 0.0} for k in SUPER_CATS}
 
@@ -219,11 +293,11 @@ def aggregate_budget(budget_data):
         forecast = abs(float(period.get("total_forecast_amount") or 0))
 
         if currency and currency.lower() == "usd":
-            actual *= GBP_USD
-            forecast *= GBP_USD
+            actual *= usd_gbp
+            forecast *= usd_gbp
         elif currency and currency.lower() == "eur":
-            actual *= 0.85
-            forecast *= 0.85
+            actual *= eur_gbp
+            forecast *= eur_gbp
 
         totals[super_cat]["actual"] += actual
         totals[super_cat]["forecast"] += forecast
@@ -243,10 +317,24 @@ def is_known_payee(payee):
     return any(k in up for k in KNOWN_PAYEES)
 
 
-def generate_report(today, auto_done, remaining_uncategorized, remaining_needs_review,
-                    recent, budget_totals):
+def generate_report(today, feed_health, auto_done, remaining_uncategorized,
+                    remaining_needs_review, recent, budget_totals):
     lines = []
     lines.append(f"# Daily Financial Review — {today}")
+    lines.append("")
+
+    # ── Feed Health (first — a dead feed silently stops data) ──
+    lines.append("## Feed Health")
+    lines.append("")
+    if feed_health:
+        lines.append("⚠️ These live feeds have not updated recently — transactions may be silently missing. No action taken automatically; check the provider.")
+        lines.append("")
+        for inst, name, last, age in feed_health:
+            lines.append(f"- **{inst} — {name}**: last updated {last} ({age} days ago).")
+    else:
+        lines.append("All live feeds syncing normally.")
+    lines.append("")
+    lines.append("---")
     lines.append("")
 
     # ── Action Required ──
@@ -262,7 +350,7 @@ def generate_report(today, auto_done, remaining_uncategorized, remaining_needs_r
         action_items.append(
             f"**{txn['payee']} — {fmt_amount(txn['amount'], currency)} | "
             f"{ta.get('name', '?')} | {txn['date']}**  \n"
-            f"Uncategorized. Assign a category."
+            f"Uncategorized. Assign a category (add to RULES to auto-handle next time)."
         )
 
     for txn in remaining_needs_review:
@@ -308,6 +396,8 @@ def generate_report(today, auto_done, remaining_uncategorized, remaining_needs_r
 
     # ── Budget Summary ──
     lines.append("## Spending by Super Category (Month to Date)")
+    lines.append("")
+    lines.append("_Note: budget figures are provisional — PocketSmith currently has duplicated/triplicated budget events that overstate the targets. Treat % used as directional until cleaned._")
     lines.append("")
     lines.append("| Super Category | MTD Spend | Budget | % Used |")
     lines.append("|---|---|---|---|")
@@ -366,11 +456,12 @@ def generate_report(today, auto_done, remaining_uncategorized, remaining_needs_r
     # ── All Clear ──
     lines.append("## All Clear")
     lines.append("")
-    lines.append(
-        "- No duplicates detected in last 48 hours.\n"
-        "- Auto-categorization rules applied successfully.\n"
-        "- Budget rollup complete."
-    )
+    clear_bits = [
+        "- All live feeds syncing." if not feed_health else "- Feed issues flagged above.",
+        "- Auto-categorization rules applied successfully.",
+        "- Budget rollup complete.",
+    ]
+    lines.append("\n".join(clear_bits))
 
     return "\n".join(lines)
 
@@ -438,12 +529,24 @@ def main():
     report_to  = os.environ.get("REPORT_TO_EMAIL", gmail_addr)
     today      = date.today().isoformat()
 
+    usd_gbp, eur_gbp = load_fx()
+
     print("── Fetching PocketSmith data ──")
     uncategorized = fetch_uncategorized(ps_key)
     needs_review  = fetch_needs_review(ps_key)
     recent        = fetch_recent(ps_key, days=2)
     budget        = fetch_budget(ps_key)
-    print(f"  uncategorized={len(uncategorized)}  needs_review={len(needs_review)}  recent={len(recent)}")
+    try:
+        accounts = fetch_transaction_accounts(ps_key)
+    except Exception as e:
+        print(f"  feed-health fetch failed: {e}", file=sys.stderr)
+        accounts = []
+    print(f"  uncategorized={len(uncategorized)}  needs_review={len(needs_review)}  recent={len(recent)}  accounts={len(accounts)}")
+
+    print("── Checking feed health ──")
+    feed_health = check_feed_health(accounts)
+    for inst, name, last, age in feed_health:
+        print(f"  stale feed: {inst} / {name} ({age}d)")
 
     print("── Applying categorization rules ──")
     auto_done  = []
@@ -455,11 +558,11 @@ def main():
     needs_review  = fetch_needs_review(ps_key)
 
     print("── Aggregating budget ──")
-    budget_totals = aggregate_budget(budget)
+    budget_totals = aggregate_budget(budget, usd_gbp, eur_gbp)
 
     print("── Generating report ──")
     report_md = generate_report(
-        today, auto_done, uncategorized, needs_review, recent, budget_totals
+        today, feed_health, auto_done, uncategorized, needs_review, recent, budget_totals
     )
     print(report_md)
 
