@@ -1,30 +1,23 @@
 name: Daily Financial Review
-
 on:
   schedule:
-    # 6:00 AM UTC = 7:00 AM BST (summer) / 8:00 AM Irish Standard Time
-    - cron: '0 6 * * *'
-
+    # 4:45 AM UTC — off-hour to avoid GitHub Actions peak queue delays
+    - cron: '45 4 * * *'
   # Run manually from the Actions tab any time
   workflow_dispatch:
-
 jobs:
   daily-review:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4.2.2
-
       - name: Set up Python
         uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.12'
-
       - name: Install dependencies
         run: pip install requests
-
       - name: Run daily financial review
         env:
           POCKETSMITH_API_KEY: ${{ secrets.POCKETSMITH_API_KEY }}
