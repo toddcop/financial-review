@@ -136,7 +136,9 @@ RULES = [
     ("THE WHITE HOUSE",    28937956, "Shopping",              False),  # clothing retailer, NOT education
     ("CLOUD PICK",         28938632, "Cafes And Restaurants", False),  # Cloud Picker Coffee, Dublin Airport
     ("DUB CLOUD PICK",     28938632, "Cafes And Restaurants", False),
-    ("COCA COLA NI",       28937964, "Groceries",             False),
+    ("COCA COLA",          28938632, "Cafes And Restaurants", False),  # vending-machine drinks (Coca Cola Ni etc.) — consumed out, not groceries
+    # Supermarkets / food retail -> Groceries
+    ("MARKS&SPENCER",      28937964, "Groceries",             False),  # M&S Simply Food (small amounts); confirmed Groceries not Shopping
     # Butchers -> Groceries
     ("BUSHMILLS MEAT",     28937964, "Groceries",             False),
     ("MOUNTSANDEL MEAT",   28937964, "Groceries",             False),
@@ -150,6 +152,8 @@ RULES = [
     ("FITZWILLIAM",        28938628, "Hotel",                 False),
     ("MARYLEBONE",         28938628, "Hotel",                 False),
     ("ARTHOUSE",           28938628, "Hotel",                 False),
+    # Parking -> Auto And Transport
+    ("NITHCO HI PARK",     28939432, "Auto And Transport",    False),  # Nithco car park, NI
     # Petrol
     ("CIRCLE K",           28938648, "Gas And Fuel",          False),
     ("APPLEGREEN",         28938648, "Gas And Fuel",          False),
@@ -177,6 +181,8 @@ RULES = [
     ("TMOBILE",            28939468, "Utilities",             False),
     # Restaurants / cafes (broad)
     ("SHANTY BITES",       28938632, "Cafes And Restaurants", False),
+    # Home Improvement / furniture
+    ("KEENS BELFAST",      28939084, "Home Improvement",      False),  # furniture store, Belfast; purchases typically for Monageer
 ]
 
 # Super-category parent_id mappings
@@ -397,7 +403,7 @@ def generate_report(today, feed_health, auto_done, remaining_uncategorized,
     # ── Budget Summary ──
     lines.append("## Spending by Super Category (Month to Date)")
     lines.append("")
-    lines.append("_Note: budget figures are provisional — PocketSmith currently has duplicated/triplicated budget events that overstate the targets. Treat % used as directional until cleaned._")
+    lines.append("**Note:** budget figures are provisional — PocketSmith currently has duplicated/triplicated budget events that overstate the targets. Treat % used as directional until cleaned.")
     lines.append("")
     lines.append("| Super Category | MTD Spend | Budget | % Used |")
     lines.append("|---|---|---|---|")
