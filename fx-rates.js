@@ -1,8 +1,8 @@
 // FX rates - written daily by GitHub Actions
 // EUR as base: how many EUR per 1 unit of foreign currency
 window.FX_RATES = {
-  GBP: 1.1715,
-  USD: 0.8745,
-  date: "2026-07-09",
+  GBP: 1.1743,
+  USD: 0.8749,
+  date: "2026-07-10",
   source: "live"
 };
