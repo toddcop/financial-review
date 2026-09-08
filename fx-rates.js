@@ -3,6 +3,6 @@
 window.FX_RATES = {
   GBP: 1.1642,
   USD: 0.8604,
-  date: "2026-09-04",
+  date: "2026-09-07",
   source: "live"
 };
